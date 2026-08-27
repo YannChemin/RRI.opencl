@@ -13,8 +13,8 @@
  *
  * PLAN.md's design (section 5, decision 5) is to write each kernel's
  * math body exactly once, so the OpenMP path (src/rri_riv.c etc.,
- * `#pragma omp parallel for` over cell index k) and a future OpenCL path
- * (cl/*.cl, `__kernel` + global-id lookup) cannot numerically diverge --
+ * `#pragma omp parallel for` over cell index k) and the OpenCL path
+ * (cl/rri_kernels.cl, `__kernel` + global-id lookup) cannot numerically diverge --
  * they call the *same compiled function*, not two independently-written
  * translations of the same Fortran formula. That divergence risk is not
  * hypothetical: the C port's full-length validation against the Fortran
@@ -50,7 +50,17 @@
  * predefined by an OpenCL C device compiler and absent under a normal C
  * compiler, so `<math.h>` is only pulled in on the host side (OpenCL C
  * has `sqrt`/`pow`/`exp`/`fabs` as language builtins, no header needed --
- * including `<math.h>` there would fail to compile).
+ * including `<math.h>` there would fail to compile). The same branch
+ * also picks `RRI_INLINE`'s expansion: plain C wants `static inline`
+ * (internal linkage, so this header can be included from multiple .c
+ * translation units without a duplicate-symbol link error); OpenCL C
+ * 1.1 -- confirmed against the Mesa Clover platform on an AMD Polaris10
+ * GPU, this port's actual remote-GPU validation target, see README.md --
+ * rejects the `static` storage-class specifier on a function at this
+ * scope entirely (a hard compile error, not a portability nicety), so
+ * the OpenCL branch drops it and uses plain `inline`; this is safe
+ * there because each OpenCL kernel source is its own translation unit,
+ * so there's no multi-TU duplicate-symbol concern to guard against.
  */
 #ifndef RRI_KERNELS_H
 #define RRI_KERNELS_H
@@ -59,7 +69,7 @@
 #include <math.h>
 #define RRI_INLINE static inline
 #else
-#define RRI_INLINE static inline
+#define RRI_INLINE inline
 #endif
 
 /**

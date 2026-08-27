@@ -51,6 +51,7 @@
  * Fortran reference: RRI.f90 (the whole file).
  */
 #include "rri/rri.h"
+#include "rri/opencl.h"
 
 #include <float.h>
 #include <math.h>
@@ -142,9 +143,21 @@ static int load_rain(const char *path, rri_rain *rain)
  * @brief Entry point: parse config, build the domain, run the coupled
  * time loop (see file-level comment for the coupling order and adaptive
  * RK45 structure), write hydro.txt/hydro_hr.txt/storage.dat.
- * @param argv[1]  Dataset directory containing RRI_Input.txt and the
- *                 relative paths it references.
- * @param argv[2]  Optional: override rri_config::lasth (hours) without
+ * @param argv[1]  Optional literal "--gpu": dispatch the four hot
+ *                 per-cell kernels (river/slope/groundwater discharge,
+ *                 infiltration) through the OpenCL backend
+ *                 (rri_cl_funcr/funcs/funcg/rri_cl_infilt, src/rri_opencl.c)
+ *                 instead of OpenMP -- see the CALL_FUNCR/CALL_FUNCS/
+ *                 CALL_FUNCG/CALL_INFILT macros just below main()'s
+ *                 local variables for how the SAME RK45 time-loop code
+ *                 below dispatches to either backend. Without this flag
+ *                 the run is CPU/OpenMP-only and does not touch OpenCL
+ *                 at all. Exits with an error if no cl_khr_fp64-capable
+ *                 OpenCL device is found.
+ * @param argv[1 or 2]  Dataset directory containing RRI_Input.txt and the
+ *                 relative paths it references (first positional arg
+ *                 after --gpu is consumed, if present).
+ * @param argv[2 or 3]  Optional: override rri_config::lasth (hours) without
  *                 editing RRI_Input.txt -- used for fast partial-length
  *                 comparison runs against the Fortran reference (see
  *                 README.md's validation procedure).
@@ -156,8 +169,10 @@ static int load_rain(const char *path, rri_rain *rain)
  */
 int main(int argc, char **argv)
 {
+    int use_gpu = 0;
+    if (argc >= 2 && strcmp(argv[1], "--gpu") == 0) { use_gpu = 1; argc--; argv++; }
     if (argc < 2) {
-        fprintf(stderr, "usage: %s <datadir> [lasth_override_hours]\n", argv[0]);
+        fprintf(stderr, "usage: %s [--gpu] <datadir> [lasth_override_hours]\n", argv[0]);
         return 1;
     }
     char datadir[512];
@@ -340,6 +355,37 @@ int main(int argc, char **argv)
 
     double *qp_t_grid = calloc(ncell, sizeof(double));
 
+    rri_cl_backend *cl = NULL;
+    if (use_gpu) {
+        cl = rri_cl_backend_init(/*prefer_gpu=*/1);
+        if (!cl) { fprintf(stderr, "main: --gpu requested but no usable OpenCL device found\n"); return 1; }
+        fprintf(stderr, "GPU backend: %s\n", rri_cl_backend_device_name(cl));
+    }
+
+    /* Backend dispatch macros: identical call-site shape to the plain
+     * CPU calls (rri_funcr/rri_funcs/rri_funcg), just routed through the
+     * GPU-backed drivers (rri_cl_funcr/funcs/funcg, src/rri_opencl.c)
+     * when `cl` is non-NULL. This keeps the RK45 control-flow structure
+     * below IDENTICAL between the CPU-only and --gpu invocations of this
+     * binary -- only the per-cell discharge kernel's backend changes,
+     * which is exactly what PLAN.md milestone 8's cross-backend
+     * validation is meant to isolate. See README.md's OpenCL section for
+     * how this was validated (PoCL locally, then the actual AMD
+     * Polaris10 GPU on the remote host) against the same solo30s
+     * comparison used to validate the CPU path. */
+#define CALL_FUNCR(V, HRI, FR, QR) \
+    (cl ? rri_cl_funcr(cl, &m.rc, (V), m.cfg.ns_river, g->area, (HRI), (FR), (QR), qr_sum_scratch) \
+        : rri_funcr(&m.rc, (V), m.cfg.ns_river, g->area, (HRI), (FR), (QR), qr_sum_scratch))
+#define CALL_FUNCS(HSI, QPT, FS, QS) \
+    (cl ? rri_cl_funcs(cl, &m.sc, (HSI), (QPT), g->area, (FS), (QS)) \
+        : rri_funcs(&m.sc, (HSI), (QPT), g->area, (FS), (QS)))
+#define CALL_FUNCG(HGI, FG, QG) \
+    (cl ? rri_cl_funcg(cl, &m.sc, (HGI), g->area, (FG), (QG)) \
+        : rri_funcg(&m.sc, (HGI), g->area, (FG), (QG)))
+#define CALL_INFILT(HSI, GFF, GF) \
+    (cl ? rri_cl_infilt(cl, &m.sc, dt, (HSI), (GFF), (GF)) \
+        : rri_infilt(&m.sc, dt, (HSI), (GFF), (GF)))
+
     rri_rk_coeffs rk; rri_rk_coeffs_init(&rk);
 
     double dt = m.cfg.dt, dt_riv = m.cfg.dt_riv;
@@ -375,22 +421,22 @@ int main(int argc, char **argv)
             for (;;) {
                 for (int k = 0; k < rc_count; k++) qr_ave_temp[k] = 0.0;
 
-                rri_funcr(&m.rc, vr_idx, m.cfg.ns_river, g->area, hr_idx, fr, qr_idx, qr_sum_scratch);
+                CALL_FUNCR(vr_idx, hr_idx, fr, qr_idx);
                 for (int k = 0; k < rc_count; k++) { double v = vr_idx[k] + rk.b21 * ddt * fr[k]; vr_temp[k] = v < 0 ? 0 : v; qr_ave_temp[k] += qr_idx[k] * ddt; }
 
-                rri_funcr(&m.rc, vr_temp, m.cfg.ns_river, g->area, hr_idx, kr2, qr_idx, qr_sum_scratch);
+                CALL_FUNCR(vr_temp, hr_idx, kr2, qr_idx);
                 for (int k = 0; k < rc_count; k++) { double v = vr_idx[k] + ddt * (rk.b31 * fr[k] + rk.b32 * kr2[k]); vr_temp[k] = v < 0 ? 0 : v; qr_ave_temp[k] += qr_idx[k] * ddt; }
 
-                rri_funcr(&m.rc, vr_temp, m.cfg.ns_river, g->area, hr_idx, kr3, qr_idx, qr_sum_scratch);
+                CALL_FUNCR(vr_temp, hr_idx, kr3, qr_idx);
                 for (int k = 0; k < rc_count; k++) { double v = vr_idx[k] + ddt * (rk.b41 * fr[k] + rk.b42 * kr2[k] + rk.b43 * kr3[k]); vr_temp[k] = v < 0 ? 0 : v; qr_ave_temp[k] += qr_idx[k] * ddt; }
 
-                rri_funcr(&m.rc, vr_temp, m.cfg.ns_river, g->area, hr_idx, kr4, qr_idx, qr_sum_scratch);
+                CALL_FUNCR(vr_temp, hr_idx, kr4, qr_idx);
                 for (int k = 0; k < rc_count; k++) { double v = vr_idx[k] + ddt * (rk.b51 * fr[k] + rk.b52 * kr2[k] + rk.b53 * kr3[k] + rk.b54 * kr4[k]); vr_temp[k] = v < 0 ? 0 : v; qr_ave_temp[k] += qr_idx[k] * ddt; }
 
-                rri_funcr(&m.rc, vr_temp, m.cfg.ns_river, g->area, hr_idx, kr5, qr_idx, qr_sum_scratch);
+                CALL_FUNCR(vr_temp, hr_idx, kr5, qr_idx);
                 for (int k = 0; k < rc_count; k++) { double v = vr_idx[k] + ddt * (rk.b61 * fr[k] + rk.b62 * kr2[k] + rk.b63 * kr3[k] + rk.b64 * kr4[k] + rk.b65 * kr5[k]); vr_temp[k] = v < 0 ? 0 : v; qr_ave_temp[k] += qr_idx[k] * ddt; }
 
-                rri_funcr(&m.rc, vr_temp, m.cfg.ns_river, g->area, hr_idx, kr6, qr_idx, qr_sum_scratch);
+                CALL_FUNCR(vr_temp, hr_idx, kr6, qr_idx);
                 for (int k = 0; k < rc_count; k++) { double v = vr_idx[k] + ddt * (rk.c1 * fr[k] + rk.c3 * kr3[k] + rk.c4 * kr4[k] + rk.c6 * kr6[k]); vr_temp[k] = v < 0 ? 0 : v; qr_ave_temp[k] += qr_idx[k] * ddt; }
 
                 /* Fortran: errmax = maxval(hr_err)/eps -- the SIGNED max, not
@@ -413,7 +459,7 @@ int main(int argc, char **argv)
                 if (ddt == 0) { fprintf(stderr, "stepsize underflow (riv)\n"); return 1; }
             }
             if (ddt == rk.ddt_min_riv) {
-                rri_funcr(&m.rc, vr_temp, m.cfg.ns_river, g->area, hr_idx, kr6, qr_idx, qr_sum_scratch);
+                CALL_FUNCR(vr_temp, hr_idx, kr6, qr_idx);
                 for (int k = 0; k < rc_count; k++) qr_ave_temp[k] = qr_idx[k] * ddt * 6.0;
             }
             if (time + ddt > t * dt) ddt = t * dt - time;
@@ -457,7 +503,7 @@ int main(int argc, char **argv)
             for (;;) {
                 for (int k = 0; k < sc_count; k++) qs_ave_temp[k] = 0.0;
 
-                rri_funcs(&m.sc, hs_idx, qp_t_idx, g->area, fs, qs_buf);
+                CALL_FUNCS(hs_idx, qp_t_idx, fs, qs_buf);
                 for (int k = 0; k < sc_count; k++) { double v = hs_idx[k] + rk.b21 * ddt * fs[k]; hs_temp[k] = v < 0 ? 0 : v; }
                 { double *qsum = calloc(sc_count, sizeof(double));
                   for (int k = 0; k < sc_count; k++) for (int l = 0; l < RRI_LMAX8; l++) qsum[k] += qs_buf[l][k];
@@ -465,23 +511,23 @@ int main(int argc, char **argv)
                   free(qsum);
                 }
 
-                rri_funcs(&m.sc, hs_temp, qp_t_idx, g->area, ks2, qs_buf);
+                CALL_FUNCS(hs_temp, qp_t_idx, ks2, qs_buf);
                 for (int k = 0; k < sc_count; k++) { double v = hs_idx[k] + ddt * (rk.b31 * fs[k] + rk.b32 * ks2[k]); hs_temp[k] = v < 0 ? 0 : v; }
                 { double *qsum = calloc(sc_count, sizeof(double)); for (int k = 0; k < sc_count; k++) for (int l = 0; l < RRI_LMAX8; l++) qsum[k] += qs_buf[l][k]; for (int k = 0; k < sc_count; k++) qs_ave_temp[k] += qsum[k] * ddt; free(qsum); }
 
-                rri_funcs(&m.sc, hs_temp, qp_t_idx, g->area, ks3, qs_buf);
+                CALL_FUNCS(hs_temp, qp_t_idx, ks3, qs_buf);
                 for (int k = 0; k < sc_count; k++) { double v = hs_idx[k] + ddt * (rk.b41 * fs[k] + rk.b42 * ks2[k] + rk.b43 * ks3[k]); hs_temp[k] = v < 0 ? 0 : v; }
                 { double *qsum = calloc(sc_count, sizeof(double)); for (int k = 0; k < sc_count; k++) for (int l = 0; l < RRI_LMAX8; l++) qsum[k] += qs_buf[l][k]; for (int k = 0; k < sc_count; k++) qs_ave_temp[k] += qsum[k] * ddt; free(qsum); }
 
-                rri_funcs(&m.sc, hs_temp, qp_t_idx, g->area, ks4, qs_buf);
+                CALL_FUNCS(hs_temp, qp_t_idx, ks4, qs_buf);
                 for (int k = 0; k < sc_count; k++) { double v = hs_idx[k] + ddt * (rk.b51 * fs[k] + rk.b52 * ks2[k] + rk.b53 * ks3[k] + rk.b54 * ks4[k]); hs_temp[k] = v < 0 ? 0 : v; }
                 { double *qsum = calloc(sc_count, sizeof(double)); for (int k = 0; k < sc_count; k++) for (int l = 0; l < RRI_LMAX8; l++) qsum[k] += qs_buf[l][k]; for (int k = 0; k < sc_count; k++) qs_ave_temp[k] += qsum[k] * ddt; free(qsum); }
 
-                rri_funcs(&m.sc, hs_temp, qp_t_idx, g->area, ks5, qs_buf);
+                CALL_FUNCS(hs_temp, qp_t_idx, ks5, qs_buf);
                 for (int k = 0; k < sc_count; k++) { double v = hs_idx[k] + ddt * (rk.b61 * fs[k] + rk.b62 * ks2[k] + rk.b63 * ks3[k] + rk.b64 * ks4[k] + rk.b65 * ks5[k]); hs_temp[k] = v < 0 ? 0 : v; }
                 { double *qsum = calloc(sc_count, sizeof(double)); for (int k = 0; k < sc_count; k++) for (int l = 0; l < RRI_LMAX8; l++) qsum[k] += qs_buf[l][k]; for (int k = 0; k < sc_count; k++) qs_ave_temp[k] += qsum[k] * ddt; free(qsum); }
 
-                rri_funcs(&m.sc, hs_temp, qp_t_idx, g->area, ks6, qs_buf);
+                CALL_FUNCS(hs_temp, qp_t_idx, ks6, qs_buf);
                 for (int k = 0; k < sc_count; k++) { double v = hs_idx[k] + ddt * (rk.c1 * fs[k] + rk.c3 * ks3[k] + rk.c4 * ks4[k] + rk.c6 * ks6[k]); hs_temp[k] = v < 0 ? 0 : v; }
                 { double *qsum = calloc(sc_count, sizeof(double)); for (int k = 0; k < sc_count; k++) for (int l = 0; l < RRI_LMAX8; l++) qsum[k] += qs_buf[l][k]; for (int k = 0; k < sc_count; k++) qs_ave_temp[k] += qsum[k] * ddt; free(qsum); }
 
@@ -527,22 +573,22 @@ int main(int argc, char **argv)
                 if (time + ddt > t * dt) ddt = t * dt - time;
                 double errmax;
                 for (;;) {
-                    rri_funcg(&m.sc, hg_idx, g->area, fg, qg_buf);
+                    CALL_FUNCG(hg_idx, fg, qg_buf);
                     for (int k = 0; k < sc_count; k++) hg_temp[k] = hg_idx[k] + rk.b21 * ddt * fg[k];
 
-                    rri_funcg(&m.sc, hg_temp, g->area, kg2, qg_buf);
+                    CALL_FUNCG(hg_temp, kg2, qg_buf);
                     for (int k = 0; k < sc_count; k++) hg_temp[k] = hg_idx[k] + ddt * (rk.b31 * fg[k] + rk.b32 * kg2[k]);
 
-                    rri_funcg(&m.sc, hg_temp, g->area, kg3, qg_buf);
+                    CALL_FUNCG(hg_temp, kg3, qg_buf);
                     for (int k = 0; k < sc_count; k++) hg_temp[k] = hg_idx[k] + ddt * (rk.b41 * fg[k] + rk.b42 * kg2[k] + rk.b43 * kg3[k]);
 
-                    rri_funcg(&m.sc, hg_temp, g->area, kg4, qg_buf);
+                    CALL_FUNCG(hg_temp, kg4, qg_buf);
                     for (int k = 0; k < sc_count; k++) hg_temp[k] = hg_idx[k] + ddt * (rk.b51 * fg[k] + rk.b52 * kg2[k] + rk.b53 * kg3[k] + rk.b54 * kg4[k]);
 
-                    rri_funcg(&m.sc, hg_temp, g->area, kg5, qg_buf);
+                    CALL_FUNCG(hg_temp, kg5, qg_buf);
                     for (int k = 0; k < sc_count; k++) hg_temp[k] = hg_idx[k] + ddt * (rk.b61 * fg[k] + rk.b62 * kg2[k] + rk.b63 * kg3[k] + rk.b64 * kg4[k] + rk.b65 * kg5[k]);
 
-                    rri_funcg(&m.sc, hg_temp, g->area, kg6, qg_buf);
+                    CALL_FUNCG(hg_temp, kg6, qg_buf);
                     for (int k = 0; k < sc_count; k++) hg_temp[k] = hg_idx[k] + ddt * (rk.c1 * fg[k] + rk.c3 * kg3[k] + rk.c4 * kg4[k] + rk.c6 * kg6[k]);
 
                     /* signed maxval, not abs -- see the river-loop comment above */
@@ -582,7 +628,7 @@ int main(int argc, char **argv)
 
         /* ---- INFILTRATION: Green-Ampt, once per outer timestep, after
          * river<->slope exchange has settled this timestep's hs. ---- */
-        rri_infilt(&m.sc, dt, hs_idx, gampt_ff_idx, gampt_f_idx);
+        CALL_INFILT(hs_idx, gampt_ff_idx, gampt_f_idx);
         rri_slo_idx2ij(&m.sc, hs_idx, ny, nx, hs);
         rri_slo_idx2ij(&m.sc, gampt_ff_idx, ny, nx, gampt_ff);
 
@@ -632,6 +678,7 @@ int main(int argc, char **argv)
     fclose(fstorage);
     if (fhydro) fclose(fhydro);
     if (fhydrohr) fclose(fhydrohr);
+    if (cl) rri_cl_backend_free(cl);
     fprintf(stderr, "done.\n");
     return 0;
 }
