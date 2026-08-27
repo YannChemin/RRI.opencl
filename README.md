@@ -93,12 +93,15 @@ implemented" below).
 **Use plain OpenMP (no `--gpu`) unless you have a specific reason not
 to.** The only real measurement so far (full 360-hour solo30s run,
 ~18.6k active cells, on the remote AMD Polaris10 host) has OpenMP
-finishing in **~35s** against **~115s** on the GPU -- the GPU is slower on
-the one problem size this has actually been benchmarked on, not faster.
-See "OpenCL backend" below for why: the current dispatch re-uploads and
-re-downloads every kernel's arguments on every single RK45 stage call
-instead of keeping state resident on the device across the sub-loop, so
-PCIe transfer/launch overhead dominates at this problem size.
+finishing in **~35s** against **~87s** on the GPU -- the GPU is slower on
+the one problem size this has actually been benchmarked on, not faster,
+even after the persistent-buffer redesign (PLAN.md milestone 10) cut the
+GPU time from an earlier ~115s. See "OpenCL backend" below for the
+current design (topology uploaded once, only the actually time-varying
+per-stage state now transferred) and why solo30s's ~18.6k cells still
+isn't enough to amortize per-stage transfer/launch overhead against a
+32-core CPU -- this may look different on a much larger domain, untested
+so far.
 
 This does NOT mean `--gpu` is useless in general -- it means the
 crossover point where a larger, more compute-bound domain would make the
@@ -114,11 +117,14 @@ tested. If you're deciding whether to reach for `--gpu` on a new problem:
   benchmark both backends on your actual problem size before assuming
   either one is faster, rather than trusting a rule of thumb nobody has
   checked.
-- **If you need this to be fast on large domains as a matter of course**,
-  the real fix is PLAN.md milestone 10 (persistent device buffers /
-  streaming execution, not yet implemented) rather than just hoping a
-  bigger grid crosses the break-even point on the current dispatch design
-  -- see "What's NOT implemented" below.
+- **If you need this to be fast on large domains as a matter of course**:
+  PLAN.md milestone 10 (persistent device buffers, topology uploaded
+  once instead of every stage) is now implemented and cut GPU time on
+  solo30s from ~115s to ~87s -- but that alone wasn't enough to beat
+  32-core OpenMP on this problem size. The next lever, if a large-domain
+  case ever needs it, is moving the flux-scatter step itself onto the
+  GPU (currently host-side by design -- see "Data model" above) rather
+  than hoping a bigger grid alone crosses the break-even point.
 
 In short: the backend choice exists and both are numerically validated
 to the same tight tolerance against the Fortran reference (see
@@ -160,12 +166,17 @@ config, so none of this blocks the validation below)
 - Periodic full-grid output (`hs_*`/`hr_*`/`qr_*`/... snapshot files) --
   only the two time-series outputs above are written.
 - TSAS particle tracking.
-- Persistent-buffer / streaming OpenCL execution (see "OpenCL backend"
-  below) -- the current dispatch uploads/downloads every kernel call's
-  buffers fresh rather than keeping state device-resident across the RK45
-  sub-loop, which is why the current GPU run is SLOWER than 32-core
-  OpenMP on solo30s (see "OpenCL backend" below) -- correctness first,
-  per PLAN.md milestone 10 ("do not optimize ahead of a profile").
+- A fully streaming/GPU-resident RK45 loop. Topology/parameter arrays
+  ARE now uploaded once and kept device-resident (PLAN.md milestone 10,
+  see "OpenCL backend" below), which materially helped (~115s -> ~87s on
+  solo30s), but the actually time-varying state (trial depth, discharge)
+  still round-trips host<->device every RK45 stage, because the
+  accept/reject error-norm and the flux-scatter step are host-side by
+  design (see `rri.h`'s file-level comment) and need that state on the
+  host to do their job. The GPU is still slower than 32-core OpenMP on
+  solo30s's problem size -- see "OpenCL backend" below for the honest
+  current numbers and what a further redesign (moving the scatter to a
+  GPU kernel, or batching multiple cells' work per launch) would need.
 
 ## OpenCL backend
 
@@ -227,23 +238,62 @@ Same tolerance tier as the CPU port on the same dataset -- the OpenCL
 kernels are numerically correct on real GPU hardware, not just PoCL's
 CPU-based OpenCL implementation.
 
+### Buffer lifecycle / persistent-buffer redesign (PLAN.md milestone 10)
+
+The first working version of this backend (milestone 8) re-uploaded
+EVERY kernel argument -- including topology/parameter arrays that never
+change during a run (`down`, `dis`, `len`, `zb`, `width`, `ns_slope`,
+`ka`, `da`, `dm`, `beta`, `soildepth`, `gammaa`, `ksv`, `faif`, `ksg`,
+`gammag`, `kg0`, `fpg`, `infilt_limit`, `dif`) -- on every single RK45
+stage call, and for the slope/groundwater kernels also re-PACKED those
+arrays from their array-of-pointers host layout into the flat
+`[l*count+k]` device layout (see `cl/rri_kernels.cl`'s file-level
+comment) fresh every call. Inspecting the dispatch code directly (not an
+external profiler -- the redundant `clCreateBuffer`/`clEnqueueWriteBuffer`
+calls for unchanging data were unambiguous) confirmed this was the
+dominant cost, not kernel compute time.
+
+Fix (`src/rri_opencl.c`): topology/parameter buffers are now uploaded
+ONCE per `rri_riv_cellset`/`rri_slo_cellset` (cached by pointer identity
+-- `main.c` passes one stable cellset pointer for a run's whole
+lifetime, so this is exact, not a heuristic) and reused by every
+subsequent kernel launch; the flat-packing happens once too. The
+genuinely time-varying state (trial depth in, discharge out) still
+transfers every RK45 stage, via `clEnqueueWriteBuffer`/
+`clEnqueueReadBuffer` into pre-allocated persistent device buffers
+(no more `clCreateBuffer`/`clReleaseMemObject` churn on the hot path,
+even for that part). This is option (a) from the milestone 10 design
+discussion: the flux-scatter step and RK45 accept/reject logic stay
+host-side/serial, unchanged -- moving the scatter itself onto the GPU
+(option (b), avoiding the shared-destination-write hazard via either
+atomics or restructuring as a per-destination gather) was judged not
+worth the added correctness risk once the topology-reupload fix alone
+delivered most of the available win; left as documented future work.
+
 **Timing** (same remote host, 32 CPU cores, first real performance data
-point for this project -- collected only after correctness was nailed
-down, per the coordinator's explicit instruction not to report
-performance before that): full 360-hour solo30s run took **~35s wall**
-on CPU/OpenMP vs **~115s wall** on the GPU. The GPU is currently SLOWER,
-and that's expected, not a red flag: this milestone's dispatch design
-(see "What's NOT implemented" above and `opencl.h`'s file-level comment)
-uploads and downloads every kernel argument fresh on every single RK45
-stage call -- thousands of small PCIe round trips over the run -- rather
-than keeping `hr_idx`/`hs_idx`/etc. resident on the device across the
-sub-loop. solo30s is also a modest problem size (~18.6k active cells) for
-this GPU, so transfer/launch overhead plausibly dominates actual compute
-time here. A throughput-oriented redesign (persistent device buffers,
-larger domains, batching) is real future work, not undertaken in this
-pass per PLAN.md milestone 10 ("do not optimize ahead of a profile") --
-this milestone's job was proving the OpenCL kernels are CORRECT on real
-GPU hardware, which is now done.
+collected only after correctness was nailed down, per the coordinator's
+explicit instruction): full 360-hour solo30s run --
+
+| backend | before (milestone 8) | after (milestone 10) |
+|---|---|---|
+| CPU/OpenMP | ~35s | ~35s (unchanged, as expected) |
+| GPU/OpenCL (`--gpu`) | ~115s | **~87s** |
+
+The persistent-buffer redesign is a real, measured ~24% speedup on the
+GPU path, and correctness held exactly at the same tolerance (re-ran the
+full Fortran comparison after the redesign: identical 0.073%/0.40%
+numbers, confirming the buffer-lifecycle change didn't perturb the
+computed physics at all). **The GPU is still ~2.5x slower than 32-core
+OpenMP on solo30s.** Two honest reasons this problem size doesn't favor
+the GPU yet: (1) per-stage host<->device transfer is still unavoidable
+given the host-side RK45 control flow -- see the design-option
+discussion above; (2) ~18.6k active cells is a modest amount of
+parallel work for a discrete GPU to amortize kernel-launch overhead
+against, especially against a 32-core CPU. A larger domain (untested so
+far -- not attempted in this pass due to time, see PLAN.md) is the
+natural next experiment to see whether a crossover point exists; moving
+the flux-scatter to the GPU (option (b) above) is the natural next
+design step if it doesn't.
 
 ## Validation
 

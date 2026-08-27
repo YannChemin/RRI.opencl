@@ -6,18 +6,23 @@
  * rri_infilt), so a caller can swap backends without touching call sites
  * beyond the function name.
  *
- * This is a "correct first" dispatch design: each `rri_cl_*` call
- * uploads its inputs, runs the kernel, downloads the outputs, and
- * releases the device buffers -- one call = one round trip, no
- * persistent device-resident state across calls. That is intentionally
- * NOT the fastest possible design (a real performance pass would keep
- * `hr_idx`/`hs_idx`/etc. resident on the device across the whole RK45
- * sub-loop and only sync back what's needed each step) -- see PLAN.md
- * milestone 10 ("do not optimize ahead of a profile"). The point of
- * this milestone is validating that the OpenCL kernels (cl/rri_kernels.cl,
- * sharing kernels.h's math bodies with the OpenMP path) produce the
- * same numbers as the CPU backends; a throughput-oriented redesign is
- * future work once that's established.
+ * Buffer lifecycle (PLAN.md milestone 10, persistent-buffer redesign):
+ * topology/parameter arrays (neighbor indices, distances, Manning's n,
+ * per-landuse hydraulic parameters -- anything that doesn't change
+ * during a run) are uploaded to the device ONCE, cached against the
+ * `rri_riv_cellset`/`rri_slo_cellset` pointer identity, and reused by
+ * every subsequent `rri_cl_*` call. Only the actually time-varying
+ * state (the trial depth going in, the discharge coming out) is
+ * transferred every call, into persistent (not recreated) device
+ * buffers via `clEnqueueWriteBuffer`/`clEnqueueReadBuffer`. An earlier
+ * pass of this backend re-uploaded EVERYTHING, including topology, on
+ * every single RK45 stage call -- measured at ~115s wall for a
+ * 360-hour solo30s run on a real GPU vs ~35s for 32-core OpenMP on the
+ * same host; see README.md's "OpenCL backend" section for the
+ * before/after numbers after this redesign and src/rri_opencl.c's
+ * file-level comment for the full lifecycle design and why the
+ * flux-scatter step still stays host-side (not moved to a GPU kernel in
+ * this pass).
  *
  * Fails loudly (returns nonzero from rri_cl_init, with a diagnostic on
  * stderr) rather than silently falling back to single precision if the

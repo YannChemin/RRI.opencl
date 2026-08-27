@@ -296,9 +296,22 @@ Do not trust a numerical port on vibes. In order:
    CPU and GPU output from one binary on one dataset) though it does mean
    an OpenCL toolchain is now a hard build dependency, not optional.
 9. `rri_tsas.c`: particle tracking, last, after the core loop is trusted.
-10. Performance pass: profile, only then consider anything beyond
-    straightforward per-cell parallelism (e.g. GPU memory layout tuning,
-    async output overlap) — do not optimize ahead of a profile.
+10. **DONE (first pass).** Performance: profiled by direct code
+    inspection (confirmed the OpenCL backend was re-uploading every
+    kernel argument, including unchanging topology, on every RK45
+    stage call — the dominant cost, not kernel compute time), then
+    fixed via a persistent-buffer redesign (`src/rri_opencl.c`):
+    topology/parameters uploaded once per cellset, only the genuinely
+    time-varying state transferred per stage. Measured result on
+    solo30s (360h, real remote GPU): ~115s → ~87s, correctness
+    unchanged (re-validated against Fortran at the same tolerance). CPU
+    32-core OpenMP still wins on this problem size (~35s) — see
+    README.md's "OpenCL backend" section for the full before/after and
+    the two remaining paths considered (flux-scatter moved to a GPU
+    kernel; a larger domain, untested so far, to see if a CPU/GPU
+    crossover exists). Neither was attempted in this pass; both are the
+    natural next steps if GPU throughput becomes the actual goal rather
+    than just correctness.
 
 ## 9. Open questions for the user before implementation starts
 
