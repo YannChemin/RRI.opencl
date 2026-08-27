@@ -80,6 +80,53 @@ still succeeds without it, just without the `#pragma omp` parallelism).
 An OpenCL SDK is detected if present but unused (see "What's NOT
 implemented" below).
 
+## Choosing a backend: OpenMP (CPU) vs `--gpu` (OpenCL)
+
+```
+./build/rri_cpu <datadir>          # OpenMP/CPU backend (default)
+./build/rri_cpu --gpu <datadir>    # OpenCL backend, runs on whatever
+                                    # cl_khr_fp64 device it finds (GPU if
+                                    # present, else fails loudly -- it does
+                                    # not silently fall back to CPU)
+```
+
+**Use plain OpenMP (no `--gpu`) unless you have a specific reason not
+to.** The only real measurement so far (full 360-hour solo30s run,
+~18.6k active cells, on the remote AMD Polaris10 host) has OpenMP
+finishing in **~35s** against **~115s** on the GPU -- the GPU is slower on
+the one problem size this has actually been benchmarked on, not faster.
+See "OpenCL backend" below for why: the current dispatch re-uploads and
+re-downloads every kernel's arguments on every single RK45 stage call
+instead of keeping state resident on the device across the sub-loop, so
+PCIe transfer/launch overhead dominates at this problem size.
+
+This does NOT mean `--gpu` is useless in general -- it means the
+crossover point where a larger, more compute-bound domain would make the
+GPU win hasn't been found yet, because only one domain size has been
+tested. If you're deciding whether to reach for `--gpu` on a new problem:
+
+- **Small-to-medium domains (roughly solo30s-sized, tens of thousands of
+  cells, or smaller): use OpenMP.** This is the only regime actually
+  measured, and OpenMP wins clearly here.
+- **Much larger domains** (hundreds of thousands+ active cells): the
+  compute-per-transfer ratio improves, so `--gpu` *may* start to win, but
+  this is an untested hypothesis, not a validated recommendation --
+  benchmark both backends on your actual problem size before assuming
+  either one is faster, rather than trusting a rule of thumb nobody has
+  checked.
+- **If you need this to be fast on large domains as a matter of course**,
+  the real fix is PLAN.md milestone 10 (persistent device buffers /
+  streaming execution, not yet implemented) rather than just hoping a
+  bigger grid crosses the break-even point on the current dispatch design
+  -- see "What's NOT implemented" below.
+
+In short: the backend choice exists and both are numerically validated
+to the same tight tolerance against the Fortran reference (see
+"Validation" below), so correctness is not a reason to prefer one over
+the other. Speed is the only axis that matters here, and on today's
+implementation and the one benchmarked problem size, OpenMP is faster --
+treat `--gpu` as a research/future-work path, not the default.
+
 ## What's implemented (OpenMP-parallel CPU, `rri_cpu`)
 
 - ESRI ASCII grid I/O (whitespace- and comma-separated variants both
