@@ -1,15 +1,23 @@
 # RRI → C + OpenMP + OpenCL Conversion Plan
 
-Status: **milestones 1-7 implemented, unit-tested, and validated against
+Status: **milestones 1-8 implemented, unit-tested, and validated against
 the compiled Fortran reference on the real solo30s dataset over its full
 360-hour run (<0.4% relative error throughout, including the flood
-peak). OpenCL (milestone 8) not started.** An initial full-length
-validation pass found a large divergence (up to 57% on storage.dat,
-~53% at the flood peak) that has since been root-caused (a missing
-river-channel bed-incision offset, `zb` vs `zb_riv` conflated -- see
-README.md's "Root-caused bug" and "Porting gotchas" sections) and fixed;
-the numbers above are post-fix. This document remains the spec for the
-OpenCL work and any remaining gaps.
+peak) -- on BOTH the CPU/OpenMP path and the OpenCL path, the latter
+confirmed on a real GPU (AMD Polaris10 via Mesa Clover, OpenCL 1.1), not
+just PoCL. See README.md's "OpenCL backend" section for the kernel
+extraction, cross-backend validation, remote-GPU build/run procedure,
+and honest timing (GPU currently slower than 32-core OpenMP on this
+problem size -- expected, see that section; this milestone's job was
+correctness, not throughput). Milestone 9 (TSAS) and dam/diversion/
+boundary/custom-cross-section support remain undone.**
+
+An initial full-length CPU-path validation pass found a large divergence
+(up to 57% on storage.dat, ~53% at the flood peak) that has since been
+root-caused (a missing river-channel bed-incision offset, `zb` vs
+`zb_riv` conflated -- see README.md's "Root-caused bug" and "Porting
+gotchas" sections) and fixed; the numbers above are post-fix. This
+document remains the spec for any remaining gaps.
 
 Reference sources (read-only, do not modify):
 
@@ -267,9 +275,26 @@ Do not trust a numerical port on vibes. In order:
 7. `rri_tecout.c`: output writers, hydrograph files, matching Fortran's
    ascii/binary output format so downstream tooling (GRASS import,
    plotting) doesn't need to change.
-8. OpenCL backend: extract kernel bodies into `kernels.h`, add `.cl`
-   wrappers for `rri_riv`, `rri_slope`, `rri_gw`, `rri_infilt`, `rri_evp`,
-   validate per §7.3.
+8. **DONE.** OpenCL backend: kernel bodies already lived in `kernels.h`
+   (written that way from the start, see its file-level comment);
+   `.cl` wrappers added for `rri_riv`/`rri_slope`/`rri_gw`/`rri_infilt`
+   (`rri_evp` doesn't exist -- evapotranspiration isn't implemented in
+   this port at all, CPU or GPU, see README.md), validated per §7.3
+   (cross-backend agreement, near-bit-exact) both locally against PoCL
+   and on a real GPU (AMD Polaris10 via Mesa Clover). One deviation from
+   §6's build-system design: kernel source is concatenated from
+   `kernels.h` + `cl/rri_kernels.cl` at RUNTIME (paths baked in as
+   compile definitions) rather than embedded into the binary at build
+   time (`bin2c`-style) -- simpler to implement correctly under time
+   pressure and works fine for validation, but means the source tree
+   must travel with the binary (see README.md's remote-GPU procedure,
+   which rsyncs the whole tree); embedding is still open if a
+   binary-only deployment is ever needed. `-DRRI_BACKEND=OMP|OPENCL`
+   build-time selection was also not implemented; instead `main.c` links
+   both backends unconditionally and picks at RUNTIME via a `--gpu` CLI
+   flag, which is more convenient for the actual use case here (compare
+   CPU and GPU output from one binary on one dataset) though it does mean
+   an OpenCL toolchain is now a hard build dependency, not optional.
 9. `rri_tsas.c`: particle tracking, last, after the core loop is trusted.
 10. Performance pass: profile, only then consider anything beyond
     straightforward per-cell parallelism (e.g. GPU memory layout tuning,
@@ -283,9 +308,15 @@ Do not trust a numerical port on vibes. In order:
   Use this for §7.4 end-to-end validation once the core loop is trusted —
   confirm with the user whether this is the intended validation domain or
   just a leftover example before relying on its outputs as ground truth.
-- Target OpenCL platforms to support (NVIDIA/AMD/Intel, discrete GPU vs.
-  CPU OpenCL runtime) — affects `cl_khr_fp64` assumptions and workgroup
-  sizing defaults.
+- **Answered**: target OpenCL platform turned out to be an AMD Polaris10
+  GPU via Mesa's Clover platform, OpenCL 1.1 (not 1.2/3.0 -- this
+  mattered concretely: OpenCL C 1.1 rejects `static` on a function at
+  kernel-source scope, which `kernels.h`'s `RRI_INLINE` macro had to
+  branch on, and requires the `cl_khr_fp64` pragma explicitly rather
+  than accepting `double` unconditionally). No workgroup-size tuning was
+  done (default/NULL local work size throughout) -- fine for
+  correctness validation, a candidate for the throughput pass in
+  milestone 10 above.
 - Priority: is OpenMP-only (CPU, milestone 7) a useful deliverable on its
   own before investing in the OpenCL backend, or is GPU execution the
   actual point and CPU is just the correctness reference?

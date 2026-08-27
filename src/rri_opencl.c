@@ -178,7 +178,17 @@ void rri_cl_backend_free(rri_cl_backend *b)
 
 const char *rri_cl_backend_device_name(const rri_cl_backend *b) { return b->device_name; }
 
-/* ---- small helpers for the "upload, run, download, release" pattern -- */
+/* ---- small helpers for the "upload, run, download, release" pattern
+ * described in opencl.h's file-level comment -- each rri_cl_* dispatch
+ * function below creates one buffer per kernel argument with
+ * CL_MEM_COPY_HOST_PTR (uploads synchronously at creation time) and
+ * releases them all again before returning, rather than keeping any
+ * device-resident state across calls. `err` is intentionally unchecked
+ * here (a failed clCreateBuffer surfaces as a NULL cl_mem, which the
+ * subsequent clSetKernelArg/clEnqueueNDRangeKernel call will itself
+ * report as CL_INVALID_MEM_OBJECT) -- fine for this correctness-focused
+ * milestone; a throughput-oriented rewrite should check every OpenCL
+ * return code properly. ------------------------------------------- */
 
 static cl_mem buf_ro(rri_cl_backend *b, const void *data, size_t bytes)
 {
@@ -186,12 +196,15 @@ static cl_mem buf_ro(rri_cl_backend *b, const void *data, size_t bytes)
     cl_mem m = clCreateBuffer(b->context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, bytes, (void *)data, &err);
     return m;
 }
+/* Read-write: used only by rri_cl_infilt, which both reads AND updates
+ * hs_idx/gampt_ff_idx in place (matching rri_infilt's CPU signature). */
 static cl_mem buf_rw(rri_cl_backend *b, void *data, size_t bytes)
 {
     cl_int err;
     cl_mem m = clCreateBuffer(b->context, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR, bytes, data, &err);
     return m;
 }
+/* Write-only, no host data to upload -- the kernel's output buffer. */
 static cl_mem buf_out(rri_cl_backend *b, size_t bytes)
 {
     cl_int err;

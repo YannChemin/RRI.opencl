@@ -1,10 +1,12 @@
 # RRI.opencl
 
 C11 port of the RRI rainfall-runoff-inundation model, following the plan in
-[`PLAN.md`](PLAN.md). Status: **core solver implemented and validated
-against the compiled Fortran reference on the real solo30s dataset over
-its full 360-hour run (<0.4% relative error throughout, including the
-flood peak); OpenCL backend not yet started.**
+[`PLAN.md`](PLAN.md). Status: **core solver AND OpenCL GPU backend
+implemented and validated against the compiled Fortran reference on the
+real solo30s dataset over its full 360-hour run (<0.4% relative error
+throughout, including the flood peak) -- on both the CPU/OpenMP path and
+the OpenCL path, the latter confirmed on an actual GPU (AMD Polaris10 via
+Mesa Clover, OpenCL 1.1), not just PoCL's CPU-only OpenCL implementation.**
 
 ## Physics overview
 
@@ -55,14 +57,16 @@ kernels parallelize cleanly*: each kernel invocation for cell k reads
 only k's own state and its precomputed neighbors' state from the
 previous timestep, and writes only k's own output -- no cell-to-cell
 dependency within one kernel call. That's what makes `rri_qr_calc`/
-`rri_qs_calc`/`rri_qg_calc` safe under OpenMP today (`#pragma omp
-parallel for` over the cellset) and is the exact seam the OpenCL work
-will build on next (an `NDRange` over the same index). The parts of the
-solver that are NOT structured this way -- the flux-scatter step that
-sums each cell's outflow into its downstream neighbor's inflow (a
-shared-destination write across loop iterations) and the RK45 accept/
-reject control flow itself -- stay serial/host-side by design; see
-`include/rri/rri.h`'s file-level comment for the full rationale.
+`rri_qs_calc`/`rri_qg_calc` safe under OpenMP (`#pragma omp parallel
+for` over the cellset) AND, as of the OpenCL backend below, safe as an
+OpenCL `clEnqueueNDRangeKernel` over the same index -- both backends run
+the literal same math (`include/rri/kernels.h`), just dispatched
+differently. The parts of the solver that are NOT structured this way --
+the flux-scatter step that sums each cell's outflow into its downstream
+neighbor's inflow (a shared-destination write across loop iterations)
+and the RK45 accept/reject control flow itself -- stay serial/host-side
+regardless of backend; see `include/rri/rri.h`'s file-level comment for
+the full rationale.
 
 ## Build & test
 
@@ -109,22 +113,103 @@ config, so none of this blocks the validation below)
 - Periodic full-grid output (`hs_*`/`hr_*`/`qr_*`/... snapshot files) --
   only the two time-series outputs above are written.
 - TSAS particle tracking.
-- **OpenCL backend.** `kernels.h` deliberately isolates the per-cell math
-  (rectangular `hq_riv`, slope `hq`, `h2lev`, groundwater `hg_calc`) as
-  pure scalar functions with no pointers/structs, specifically so they
-  compile unchanged as OpenCL C kernel bodies -- but no `.cl` files or
-  host-side dispatch exist yet. This is PLAN.md milestone 8, the natural
-  next step now that the CPU reference is validated.
+- Persistent-buffer / streaming OpenCL execution (see "OpenCL backend"
+  below) -- the current dispatch uploads/downloads every kernel call's
+  buffers fresh rather than keeping state device-resident across the RK45
+  sub-loop, which is why the current GPU run is SLOWER than 32-core
+  OpenMP on solo30s (see "OpenCL backend" below) -- correctness first,
+  per PLAN.md milestone 10 ("do not optimize ahead of a profile").
+
+## OpenCL backend
+
+Implemented (PLAN.md milestone 8): `cl/rri_kernels.cl` has OpenCL
+`__kernel` wrappers for the four hot per-cell kernels (river discharge
+`qr_calc`, hillslope discharge `qs_calc`, groundwater discharge
+`qg_calc`, Green-Ampt infiltration) built from `include/rri/kernels.h`'s
+math bodies -- literally the same header text, concatenated at runtime
+(`src/rri_opencl.c`: `rri_cl_backend_init`) as `"#pragma OPENCL EXTENSION
+cl_khr_fp64 : enable\n"` + `kernels.h`'s contents + `rri_kernels.cl`'s
+contents, handed to `clCreateProgramWithSource` as separate strings so
+`kernels.h` reaches the OpenCL compiler completely unmodified. The
+`cl_khr_fp64` pragma is REQUIRED, not optional, on an OpenCL-1.1 device
+(confirmed against the real GPU below) -- without it the kernel fails to
+compile the moment it touches a `double`.
+
+`src/main.c` gained a `--gpu` flag: with it, the exact same adaptive-
+RK45 time loop dispatches its four hot kernels through
+`rri_cl_funcr`/`rri_cl_funcs`/`rri_cl_funcg`/`rri_cl_infilt`
+(`src/rri_opencl.c`) instead of the OpenMP versions -- no duplicated
+control-flow logic between the CPU-only and `--gpu` code paths, only the
+kernel dispatch differs (see `main.c`'s `CALL_FUNCR`/`CALL_FUNCS`/
+`CALL_FUNCG`/`CALL_INFILT` macros).
+
+**Cross-backend validation** (PLAN.md section 7.3): `tests/test_opencl_cross_backend.c`
+runs a 5x5 synthetic domain's `qr_calc`/`qs_calc`/`qg_calc`/`infilt`
+through both the OpenMP and OpenCL code paths and asserts agreement --
+passes locally against PoCL (max abs diff ~1e-18 to 1e-22, pure
+floating-point-ordering noise, effectively bit-exact as predicted since
+none of these kernels contain a reduction) and against the real remote
+GPU below.
+
+**Real-GPU validation**: built and run on `yann@10.42.0.89`, which
+exposes an AMD Radeon Polaris10 GPU via Mesa's Clover OpenCL platform
+(**OpenCL 1.1** -- a `rusticl` platform claiming OpenCL 3.0 also exists
+there but reports 0 devices; the code targets whichever `cl_khr_fp64`-
+capable device it finds, which in practice means Clover). Procedure:
+`rsync` the whole source tree (not just a binary -- `cl/rri_kernels.cl`
+and `include/rri/kernels.h` are read from disk at runtime by
+`rri_cl_backend_init`, see `RRI_KERNELS_H_PATH`/`RRI_CL_SRC_PATH` in
+`CMakeLists.txt`) to the remote host over passwordless SSH, build there
+with the same CMake invocation, run `ctest` (7/7 pass, including the
+cross-backend test against the actual GPU), then run
+`./build/rri_cpu --gpu solo30s_run/` on a copy of the solo30s dataset
+also rsynced over, and compare the resulting `storage.dat`/`hydro.txt`
+against the SAME Fortran reference output already validated against the
+CPU port (transferred back via `scp`, compared locally with `numpy`).
+
+Full 360-hour solo30s run, GPU vs Fortran:
+
+| metric | GPU (Polaris10/Clover) vs Fortran | CPU/OpenMP vs Fortran (for comparison) |
+|---|---|---|
+| storage.dat max relative error | **0.073%** | 0.069% |
+| hydro.txt max relative error | **0.40%** | 0.37% |
+| hydro.txt mean relative error | **0.16%** | 0.16% |
+| peak discharge (Fortran / this port) | 2114.46 / 2120.58 m^3/s | 2114.46 / 2121.44 m^3/s |
+
+Same tolerance tier as the CPU port on the same dataset -- the OpenCL
+kernels are numerically correct on real GPU hardware, not just PoCL's
+CPU-based OpenCL implementation.
+
+**Timing** (same remote host, 32 CPU cores, first real performance data
+point for this project -- collected only after correctness was nailed
+down, per the coordinator's explicit instruction not to report
+performance before that): full 360-hour solo30s run took **~35s wall**
+on CPU/OpenMP vs **~115s wall** on the GPU. The GPU is currently SLOWER,
+and that's expected, not a red flag: this milestone's dispatch design
+(see "What's NOT implemented" above and `opencl.h`'s file-level comment)
+uploads and downloads every kernel argument fresh on every single RK45
+stage call -- thousands of small PCIe round trips over the run -- rather
+than keeping `hr_idx`/`hs_idx`/etc. resident on the device across the
+sub-loop. solo30s is also a modest problem size (~18.6k active cells) for
+this GPU, so transfer/launch overhead plausibly dominates actual compute
+time here. A throughput-oriented redesign (persistent device buffers,
+larger domains, batching) is real future work, not undertaken in this
+pass per PLAN.md milestone 10 ("do not optimize ahead of a profile") --
+this milestone's job was proving the OpenCL kernels are CORRECT on real
+GPU hardware, which is now done.
 
 ## Validation
 
-Built with `cmake -B build && cmake --build build`, then `ctest` runs 6
+Built with `cmake -B build && cmake --build build`, then `ctest` runs 7
 unit tests (GIS I/O round-trip incl. header-mismatch rejection, geodesic
 distance, rectangular-section `hr2vr`/`vr2hr` inverses, index-setting
 consistency on a synthetic domain, zero-head-gradient implies zero flux
 for the river/slope/groundwater kernels, `storage_calc` -- including a
 regression test for the exact `riv_thresh>=0` vs `riv_thresh==0` bug the
-Python port hit).
+Python port hit -- and the OpenCL cross-backend agreement test, see
+"OpenCL backend" above). Building requires an OpenCL ICD loader + headers
+now that the OpenCL backend is unconditionally linked into `rri_cpu`
+(only whether `--gpu` is passed at runtime decides if it's touched).
 
 Real-dataset validation against the compiled Fortran binary
 (`$HOME/dev/RRI_1.4.2.7_Linux`, `make` -> `0_rri_1_4_2_7_Linux`) on
@@ -278,7 +363,10 @@ comments in each file.
 ```
 include/rri/rri.h       All public types + function declarations
 include/rri/kernels.h   Shared per-cell math (river/slope/gw hq relations,
-                         h2lev) -- written once for eventual OpenMP+OpenCL sharing
+                         h2lev) -- one copy, included verbatim by both the
+                         OpenMP (.c) and OpenCL (.cl) backends
+include/rri/opencl.h    OpenCL backend API (device init, rri_cl_qr_calc/
+                         qs_calc/qg_calc/infilt, rri_cl_funcr/funcs/funcg)
 src/rri_io.c            GIS grid I/O, RRI_Input.txt config parser, hubeny_sub
 src/rri_setup.c         idx setting, ij2idx/idx2ij, rectangular section, storage_calc
 src/rri_rk.c            Cash-Karp RK45 coefficients (verbatim from RRI.f90)
@@ -287,20 +375,23 @@ src/rri_slope.c         funcs / qs_calc (OpenMP)
 src/rri_gw.c            funcg / qg_calc / gw_recharge / gw_lose / gw_exfilt (OpenMP)
 src/rri_infilt.c        Green-Ampt infiltration (OpenMP)
 src/rri_rivslo.c        funcrs (river<->slope exchange, host-side)
-src/main.c              STEP 0-2 setup + main adaptive-RK45 time loop
-tests/                  6 unit tests (CTest)
+src/rri_opencl.c        OpenCL device selection, program build, kernel dispatch
+cl/rri_kernels.cl       OpenCL __kernel wrappers around kernels.h's math
+src/main.c              STEP 0-2 setup + main adaptive-RK45 time loop;
+                         `--gpu` dispatches the hot kernels through OpenCL
+tests/                  7 unit tests (CTest), incl. OpenCL cross-backend agreement
 ```
 
 ## Next steps (PLAN.md milestone order)
 
-1. OpenCL backend (milestone 8): `.cl` kernels for `qr_calc`/`qs_calc`
-   sharing `kernels.h`'s math bodies, host dispatch, cross-backend
-   agreement test (CPU serial vs OpenMP vs OpenCL on the synthetic
-   domain) per PLAN.md section 7.3. Now that the CPU core is validated
-   end-to-end on the full 360-hour solo30s run (see above), this is
-   unblocked.
-2. Dam, diversion, boundary conditions, custom cross-sections if the
+1. Dam, diversion, boundary conditions, custom cross-sections if the
    project needs domains that use them.
+2. A throughput-oriented OpenCL redesign (persistent device buffers
+   across the RK45 sub-loop instead of upload/download per kernel call)
+   -- see "OpenCL backend" above for why the current dispatch is slower
+   than 32-core OpenMP on solo30s; only worth doing once there's an
+   actual workload (bigger domain, or a use case that needs GPU
+   throughput) to profile against, per PLAN.md milestone 10.
 3. Consider porting the (currently omitted) levee-height DEM adjustment
    in main.c's grid setup (`zs += height` before deriving zb/zb_riv when
    `height_param>0`) before running any dataset that sets it nonzero --
